@@ -48,11 +48,18 @@ from pulp_deb.app.models import (
     PackageReleaseComponent,
     InstallerPackage,
     AptRemote,
+    SourceIndex,
+    DscFile,
+    SourceFile,
+    SourceReleaseComponent,
+    DscFileReleaseComponent,
 )
 
 from pulp_deb.app.serializers import (
     InstallerPackage822Serializer,
     Package822Serializer,
+    DscFile822Serializer,
+    SourceSha256Serializer,
 )
 
 from pulp_deb.app.constants import (
@@ -529,8 +536,11 @@ class DebFirstStage(Stage):
                     for architecture in architectures
                 ]
             )
+        # Handle source indices
         if self.remote.sync_sources:
-            raise NotImplementedError("Syncing source repositories is not yet implemented.")
+            pending_tasks.extend(
+                [self._handle_source_index(release_file, release_component, file_references)]
+            )
         await asyncio.gather(*pending_tasks)
 
     async def _handle_package_index(
@@ -621,6 +631,175 @@ class DebFirstStage(Stage):
                 )
             )
             await self.put(package_release_component_dc)
+
+    async def _handle_source_index(self, release_file, release_component, file_references):
+        # Create source_index
+        release_base_path = os.path.dirname(release_file.relative_path)
+        if release_file.distribution[-1] == "/":
+            # Flat repo format
+            source_index_dir = ""
+        else:
+            source_index_dir = os.path.join(release_component.plain_component, "source")
+        d_artifacts = []
+        for filename in ["Sources", "Sources.gz", "Sources.xz", "Release"]:
+            path = os.path.join(source_index_dir, filename)
+            if path in file_references:
+                relative_path = os.path.join(release_base_path, path)
+                d_artifacts.append(self._to_d_artifact(relative_path, file_references[path]))
+        if not d_artifacts:
+            # No reference here, skip this component
+            return
+        log.info(_("Downloading: {}/Sources").format(source_index_dir))
+        content_unit = SourceIndex(
+            release=release_file,
+            component=release_component.component,
+            sha256=d_artifacts[0].artifact.sha256,
+            relative_path=os.path.join(release_base_path, source_index_dir, "Sources"),
+        )
+        source_index = await self._create_unit(
+            DeclarativeContent(content=content_unit, d_artifacts=d_artifacts)
+        )
+        if not source_index:
+            if self.remote.ignore_missing_source_indices:
+                log.info(
+                    _("No sources index for component {}. Skipping.").format(
+                        release_component.component
+                    )
+                )
+                return
+        # Interpret policy to download Artifacts or not
+        deferred_download = self.remote.policy != Remote.IMMEDIATE
+
+        # Simplify translations/mapping
+        csum_translation = {
+            "md5": {"list": "Files", "key": "md5sum", "field": "dsc_files"},
+            "sha1": {"list": "Checksums-Sha1", "key": "sha1", "field": "dsc_checksums_sha1"},
+            "sha256": {
+                "list": "Checksums-Sha256",
+                "key": "sha256",
+                "field": "dsc_checksums_sha256",
+            },
+            "sha512": {
+                "list": "Checksums-Sha512",
+                "key": "sha512",
+                "field": "dsc_checksums_sha512",
+            },
+        }
+
+        def _aggregrate_checksums(source_paragraph, source_file, dsc_file):
+            """
+            Aggregate the data from the various file lists found in a source paragraph
+            without making any assumptions about order while also properly handling
+            the name translation.
+            """
+            csum_data = {}
+            for csum in ["md5", "sha1", "sha512"]:
+                if csum in settings.ALLOWED_CONTENT_CHECKSUMS:
+                    if csum_translation[csum]["list"] in source_paragraph:
+                        for item in source_paragraph[csum_translation[csum]["list"]]:
+                            if item["name"] == source_file["name"]:
+                                csum_data[csum] = item[csum_translation[csum]["key"]]
+                                csum_data[csum_translation[csum]["field"]] = dsc_file
+            if "md5" in csum_data:
+                csum_data["md5sum"] = csum_data["md5"]
+            return csum_data
+
+        # parse source_index
+        source_futures = []
+        dsc_file_futures = []
+        for source_paragraph in deb822.Sources.iter_paragraphs(source_index.main_artifact.file):
+            try:
+                source_dir = source_paragraph["Directory"]
+                # Handle the dsc file
+                for source_file in source_paragraph["Checksums-Sha256"]:
+                    source_relpath = os.path.join(source_dir, source_file["name"])
+                    if not source_file["name"].endswith(".dsc"):
+                        continue
+                    log.debug(_("Downloading dsc file {}.").format(source_file["name"]))
+
+                    # Quirk: Package in Sources <-> Source in DSC
+                    source_paragraph["Source"] = source_paragraph["Package"]
+                    source_paragraph.pop("Package")
+
+                    csum_data = _aggregrate_checksums(source_paragraph, source_file, None)
+
+                    serializer = DscFile822Serializer.from822(data=source_paragraph)
+                    serializer.is_valid(raise_exception=True)
+                    source_content_unit = DscFile(
+                        relative_path=source_relpath,
+                        name=source_file["name"],
+                        size=source_file["size"],
+                        sha256=source_file["sha256"],
+                        **csum_data,
+                        **serializer.validated_data,
+                    )
+                    source_path = os.path.join(self.parsed_url.path, source_relpath)
+                    source_da = DeclarativeArtifact(
+                        artifact=Artifact(**{"sha256": source_file["sha256"]}),
+                        url=urlunparse(self.parsed_url._replace(path=source_path)),
+                        relative_path=source_relpath,
+                        remote=self.remote,
+                        deferred_download=deferred_download,
+                    )
+                    source_dc = DeclarativeContent(
+                        content=source_content_unit, d_artifacts=[source_da]
+                    )
+                    dsc_file_futures.append(source_dc)
+                    dsc_file = await self._create_unit(source_dc)
+                    # Insert ourself into the various file lists
+                    for csum in ["md5", "sha1", "sha256", "sha512"]:
+                        if csum in settings.ALLOWED_CONTENT_CHECKSUMS:
+                            if csum_translation[csum]["list"] in source_paragraph:
+                                setattr(dsc_file, csum_translation[csum]["field"], dsc_file)
+                    dsc_file.save()
+                # Handle source files (ie non-dsc files)
+                for source_file in source_paragraph["Checksums-Sha256"]:
+                    source_relpath = os.path.join(source_dir, source_file["name"])
+                    if source_file["name"].endswith(".dsc"):
+                        continue
+                    log.debug(_("Downloading source file {}.").format(source_file["name"]))
+
+                    csum_data = _aggregrate_checksums(source_paragraph, source_file, dsc_file)
+
+                    serializer = SourceSha256Serializer(data=source_file)
+                    serializer.is_valid(raise_exception=True)
+                    source_content_unit = SourceFile(
+                        relative_path=source_relpath,
+                        dsc_checksums_sha256=dsc_file,
+                        **csum_data,
+                        **serializer.validated_data,
+                    )
+                    source_path = os.path.join(self.parsed_url.path, source_relpath)
+                    source_da = DeclarativeArtifact(
+                        artifact=Artifact(**{"sha256": source_file["sha256"]}),
+                        url=urlunparse(self.parsed_url._replace(path=source_path)),
+                        relative_path=source_relpath,
+                        remote=self.remote,
+                        deferred_download=deferred_download,
+                    )
+                    source_dc = DeclarativeContent(
+                        content=source_content_unit, d_artifacts=[source_da]
+                    )
+                    source_futures.append(source_dc)
+                    await self.put(source_dc)
+            except KeyError:
+                log.warning(_("Ignoring invalid source paragraph. {}").format(source_paragraph))
+        # Assign dsc files to this release_component
+        for dsc_file_future in dsc_file_futures:
+            dsc_file = await dsc_file_future.resolution()
+            dsc_file_release_component_dc = DeclarativeContent(
+                content=DscFileReleaseComponent(
+                    dsc_file=dsc_file, release_component=release_component
+                )
+            )
+            await self.put(dsc_file_release_component_dc)
+        # Assign sources to this release_component
+        for source_future in source_futures:
+            source = await source_future.resolution()
+            source_release_component_dc = DeclarativeContent(
+                content=SourceReleaseComponent(source=source, release_component=release_component)
+            )
+            await self.put(source_release_component_dc)
 
     async def _handle_installer_file_index(
         self, release_file, release_component, architecture, file_references

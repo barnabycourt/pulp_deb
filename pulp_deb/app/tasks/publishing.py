@@ -26,9 +26,16 @@ from pulp_deb.app.models import (
     ReleaseComponent,
     VerbatimPublication,
     AptReleaseSigningService,
+    DscFile,
+    SourceFile,
+    SourceReleaseComponent,
+    DscFileReleaseComponent,
 )
 
-from pulp_deb.app.serializers import Package822Serializer
+from pulp_deb.app.serializers import (
+    Package822Serializer,
+    DscFile822Serializer,
+)
 
 from pulp_deb.app.constants import (
     NO_MD5_WARNING_MESSAGE,
@@ -130,6 +137,16 @@ def publish(repository_version_pk, simple=False, structured=False, signing_servi
                     pk__in=repo_version.content.order_by("-pulp_created"),
                 ):
                     release_helper.components[component].add_package(package)
+
+                for dsc_file in DscFile.objects.filter(
+                    pk__in=repo_version.content.order_by("-pulp_created"),
+                ):
+                    release_helper.components[component].add_dsc_file(dsc_file)
+
+                for source_file in SourceFile.objects.filter(
+                    pk__in=repo_version.content.order_by("-pulp_created"),
+                ):
+                    release_helper.components[component].add_source_file(source_file)
                 release_helper.finish()
 
             if structured:
@@ -169,6 +186,28 @@ def publish(repository_version_pk, simple=False, structured=False, signing_servi
                             )
                         except IntegrityError:
                             continue
+
+                    for drc in DscFileReleaseComponent.objects.filter(
+                        pk__in=repo_version.content.order_by("-pulp_created"),
+                        release_component__in=components,
+                    ):
+                        try:
+                            release_helper.components[drc.release_component.component].add_dsc_file(
+                                drc.dsc_file
+                            )
+                        except IntegrityError:
+                            continue
+
+                    for src in SourceReleaseComponent.objects.filter(
+                        pk__in=repo_version.content.order_by("-pulp_created"),
+                        release_component__in=components,
+                    ):
+                        try:
+                            release_helper.components[
+                                src.release_component.component
+                            ].add_source_file(src.source)
+                        except IntegrityError:
+                            continue
                     release_helper.finish()
 
     log.info(_("Publication: {publication} created").format(publication=publication.pk))
@@ -180,6 +219,7 @@ class _ComponentHelper:
         self.component = component
         self.plain_component = os.path.basename(component)
         self.package_index_files = {}
+        self.source_index_file_info = None
 
         for architecture in self.parent.architectures:
             package_index_path = os.path.join(
@@ -194,6 +234,19 @@ class _ComponentHelper:
                 open(package_index_path, "wb"),
                 package_index_path,
             )
+        # Source indicies file
+        source_index_path = os.path.join(
+            "dists",
+            self.parent.distribution.strip("/"),
+            self.plain_component,
+            "source",
+            "Sources",
+        )
+        os.makedirs(os.path.dirname(source_index_path), exist_ok=True)
+        self.source_index_file_info = (
+            open(source_index_path, "wb"),
+            source_index_path,
+        )
 
     def add_package(self, package):
         published_artifact = PublishedArtifact(
@@ -207,6 +260,29 @@ class _ComponentHelper:
             self.package_index_files[package.architecture][0]
         )
         self.package_index_files[package.architecture][0].write(b"\n")
+
+    # Publish DSC file and setup to create Sources Indices file
+    def add_dsc_file(self, dsc_file):
+        published_artifact = PublishedArtifact(
+            relative_path=dsc_file.derived_path(self.component),
+            publication=self.parent.publication,
+            content_artifact=dsc_file.contentartifact_set.get(),
+        )
+        published_artifact.save()
+        dsc_file_serializer = DscFile822Serializer(dsc_file, context={"request": None})
+        dsc_file_serializer.to822(self.component, paragraph=True).dump(
+            self.source_index_file_info[0]
+        )
+        self.source_index_file_info[0].write(b"\n")
+
+    # Publish Source file
+    def add_source_file(self, source_file):
+        published_artifact = PublishedArtifact(
+            relative_path=source_file.derived_path(self.component),
+            publication=self.parent.publication,
+            content_artifact=source_file.contentartifact_set.get(),
+        )
+        published_artifact.save()
 
     def finish(self):
         # Publish Packages files
@@ -223,6 +299,21 @@ class _ComponentHelper:
             gz_package_index.save()
             self.parent.add_metadata(package_index)
             self.parent.add_metadata(gz_package_index)
+        # Publish Sources Indices file
+        if self.source_index_file_info is not None:
+            (source_index_file, source_index_path) = self.source_index_file_info
+            source_index_file.close()
+            gz_source_index_path = _zip_file(source_index_path)
+            source_index = PublishedMetadata.create_from_file(
+                publication=self.parent.publication, file=File(open(source_index_path, "rb"))
+            )
+            source_index.save()
+            gz_source_index = PublishedMetadata.create_from_file(
+                publication=self.parent.publication, file=File(open(gz_source_index_path, "rb"))
+            )
+            gz_source_index.save()
+            self.parent.add_metadata(source_index)
+            self.parent.add_metadata(gz_source_index)
 
 
 class _ReleaseHelper:

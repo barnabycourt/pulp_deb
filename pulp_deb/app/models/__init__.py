@@ -12,6 +12,11 @@ from .content import (
     ReleaseArchitecture,
     ReleaseComponent,
     ReleaseFile,
+    SourceIndex,
+    DscFile,
+    SourceFile,
+    SourceReleaseComponent,
+    DscFileReleaseComponent,
 )
 
 from .publication import AptDistribution, AptPublication, VerbatimPublication
