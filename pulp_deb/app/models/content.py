@@ -97,6 +97,36 @@ class PackageIndex(Content):
         return self._artifacts.get(sha256=self.sha256)
 
 
+class SourceIndex(Content):
+    """
+    The "SourceIndex" content type.
+
+    This model represents the Sources file for a specific
+    component.
+    It's artifacts should include all (non-)compressed versions
+    of the upstream Sources file.
+    """
+
+    TYPE = "source_index"
+
+    release = models.ForeignKey(ReleaseFile, on_delete=models.CASCADE)
+    component = models.CharField(max_length=255)
+    relative_path = models.TextField()
+    sha256 = models.CharField(max_length=255)
+
+    class Meta:
+        default_related_name = "%(app_label)s_%(model_name)s"
+        verbose_name_plural = "SourceIndices"
+        unique_together = (("relative_path", "sha256"),)
+
+    @property
+    def main_artifact(self):
+        """
+        Retrieve teh uncompressed SourceIndex artifact.
+        """
+        return self._artifacts.get(sha256=self.sha256)
+
+
 class InstallerFileIndex(Content):
     """
     The "InstallerFileIndex" content type.
@@ -324,3 +354,190 @@ class PackageReleaseComponent(Content):
     class Meta:
         default_related_name = "%(app_label)s_%(model_name)s"
         unique_together = (("package", "release_component"),)
+
+
+class BaseSource(Content):
+    """
+    The BaseSource content type.
+
+    This is used to represent a single source file in a "sources" indices file
+    paragraph. ie. an lineitem in the Files, Checksums-Sha1, Checksums-Sha256,
+    and Checksums-512 lists.
+    """
+
+    name = models.TextField(null=False)
+    relative_path = models.TextField(null=False)
+
+    size = models.BigIntegerField(null=True)
+    md5 = models.CharField(max_length=32, null=True)
+    md5sum = models.CharField(max_length=32, null=True)
+    sha1 = models.CharField(max_length=40, null=True)
+    sha256 = models.CharField(max_length=64, null=False)
+    sha512 = models.CharField(max_length=128, null=True)
+
+    dsc_files = models.ForeignKey(
+        "DscFile",
+        related_name="files",
+        on_delete=models.CASCADE,
+        null=True,
+    )
+
+    dsc_checksums_sha1 = models.ForeignKey(
+        "DscFile",
+        related_name="checksums_sha1",
+        on_delete=models.CASCADE,
+        null=True,
+    )
+
+    dsc_checksums_sha256 = models.ForeignKey(
+        "DscFile",
+        related_name="checksums_sha256",
+        on_delete=models.CASCADE,
+        null=True,
+    )
+
+    dsc_checksums_sha512 = models.ForeignKey(
+        "DscFile",
+        related_name="checksums_sha512",
+        on_delete=models.CASCADE,
+        null=True,
+    )
+
+    class Meta:
+        default_related_name = "%(app_label)s_%(model_name)s"
+        unique_together = (("relative_path", "sha256"),)
+
+
+class SourceFile(BaseSource):
+    """
+    The SourceFile content type.
+
+    This is used to represent a single source file in a "sources" indices file
+    paragraph of either the orig.tar or debian.tar type. These files contain
+    no meta-data of their own, only attributes as described in BaseSource.
+    """
+
+    TYPE = "source_file"
+
+    def derived_path(self, component=""):
+        """Assemble filename in pool directory."""
+        sourcename = self.name
+        sourcename = sourcename.split("_")[0]
+        prefix = sourcename[0]
+        return os.path.join(
+            "pool",
+            component,
+            prefix,
+            sourcename,
+            self.name,
+        )
+
+    class Meta:
+        default_related_name = "%(app_label)s_%(model_name)s"
+
+
+class DscFile(BaseSource):
+    """
+    The Debian Source Control file content type.
+
+    This model must contain all information that is needed to
+    generate the corresponding paragraph in "Souces" indices files.
+    """
+
+    TYPE = "dsc_file"
+
+    SUFFIX = "dsc"
+
+    format = models.TextField()  # the format of the source package
+    source = models.TextField()  # source package nameformat
+    binary = models.TextField(null=True)  # lists binary packages which a source package can produce
+    architecture = models.TextField(null=True)  # all, i386, ...
+    version = models.TextField()  # The format is: [epoch:]upstream_version[-debian_revision]
+    maintainer = models.TextField()
+    uploaders = models.TextField(null=True)  # Names and emails of co-maintainers
+    homepage = models.TextField(null=True)
+    vcs_browser = models.TextField(null=True)
+    vcs_arch = models.TextField(null=True)
+    vcs_bzr = models.TextField(null=True)
+    vcs_cvs = models.TextField(null=True)
+    vcs_darcs = models.TextField(null=True)
+    vcs_git = models.TextField(null=True)
+    vcs_hg = models.TextField(null=True)
+    vcs_mtn = models.TextField(null=True)
+    vcs_snv = models.TextField(null=True)
+    testsuite = models.TextField(null=True)
+    dgit = models.TextField(null=True)
+    standards_version = models.TextField()  # most recent version of the standards the pkg complies
+    build_depends = models.TextField(null=True)
+    build_depends_indep = models.TextField(null=True)
+    build_depends_arch = models.TextField(null=True)
+    build_conflicts = models.TextField(null=True)
+    build_conflicts_indep = models.TextField(null=True)
+    build_conflicts_arch = models.TextField(null=True)
+    package_list = models.TextField(
+        null=True
+    )  # all the packages that can be built from the source package
+
+    def __init__(self, *args, **kwargs):
+        # Sanatize kwargs
+        for kw in ["files", "checksums_sha1", "checksums_sha256", "checksums_sha512"]:
+            if kw in kwargs:
+                kwargs.pop(kw)
+        super().__init__(*args, **kwargs)
+
+    def derived_name(self):
+        """Print a nice name for the Dsc file."""
+        return "{}_{}.{}".format(self.source, self.version, self.SUFFIX)
+
+    def derived_path(self, component=""):
+        """Assemble filename in pool directory."""
+        sourcename = self.source
+        prefix = sourcename[0]
+        return os.path.join(
+            "pool",
+            component,
+            prefix,
+            sourcename,
+            self.derived_name(),
+        )
+
+    repo_key_fields = ("source", "version")
+
+    class Meta:
+        default_related_name = "%(app_label)s_%(model_name)s"
+
+
+class SourceReleaseComponent(Content):
+    """
+    The SourceReleaseComponent.
+
+    This is the join table that decides, which Sources (in which RepositoryVersions) belong to
+    which ReleaseComponents.
+    """
+
+    TYPE = "source_release_component"
+
+    source = models.ForeignKey(SourceFile, on_delete=models.CASCADE)
+    release_component = models.ForeignKey(ReleaseComponent, on_delete=models.CASCADE)
+
+    class Meta:
+        default_related_name = "%(app_label)s_%(model_name)s"
+        unique_together = (("source", "release_component"),)
+
+
+class DscFileReleaseComponent(Content):
+    """
+    The DscReleaseComponent.
+
+    This is the join table that decides, which Dsc (in which RepositoryVersions) belong to
+    which ReleaseComponents.
+    """
+
+    TYPE = "dsc_file_release_component"
+
+    dsc_file = models.ForeignKey(DscFile, on_delete=models.CASCADE)
+    release_component = models.ForeignKey(ReleaseComponent, on_delete=models.CASCADE)
+
+    class Meta:
+        default_related_name = "%(app_label)s_%(model_name)s"
+        unique_together = (("dsc_file", "release_component"),)

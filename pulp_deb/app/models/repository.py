@@ -14,6 +14,11 @@ from pulp_deb.app.models import (
     ReleaseArchitecture,
     ReleaseComponent,
     ReleaseFile,
+    SourceIndex,
+    DscFile,
+    SourceFile,
+    SourceReleaseComponent,
+    DscFileReleaseComponent,
 )
 
 
@@ -34,6 +39,11 @@ class AptRepository(Repository):
         ReleaseArchitecture,
         ReleaseComponent,
         ReleaseFile,
+        SourceIndex,
+        DscFile,
+        SourceFile,
+        SourceReleaseComponent,
+        DscFileReleaseComponent,
     ]
     REMOTE_TYPES = [
         AptRemote,

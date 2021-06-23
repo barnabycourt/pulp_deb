@@ -11,6 +11,11 @@ from .content import (
     ReleaseArchitectureViewSet,
     ReleaseComponentViewSet,
     ReleaseFileViewSet,
+    SourceIndexViewSet,
+    DscFileViewSet,
+    SourceFileViewSet,
+    SourceReleaseComponentViewSet,
+    DscFileReleaseComponentViewSet,
 )
 
 from .publication import AptDistributionViewSet, AptPublicationViewSet, VerbatimPublicationViewSet
